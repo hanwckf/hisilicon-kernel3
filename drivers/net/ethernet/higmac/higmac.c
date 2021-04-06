@@ -65,6 +65,7 @@ int calculate_port_mode(enum speed_mode speed, phy_interface_t phy_intf,
 	case PHY_INTERFACE_MODE_RMII:
 		if_mode = interface_mode_rmii;
 		break;
+	case PHY_INTERFACE_MODE_RGMII_ID:
 	case PHY_INTERFACE_MODE_RGMII:
 		if_mode = interface_mode_rgmii;
 		break;

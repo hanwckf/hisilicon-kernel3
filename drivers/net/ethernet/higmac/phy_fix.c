@@ -1242,6 +1242,35 @@ int KSZ9031RNX_phy_fix(struct phy_device *phy_dev)
 	return 0;
 }
 
+#define RTL8211F_PAGE_SELECT	0x1f
+#define RTL8211F_TX_DELAY	BIT(8)
+#define RTL8211F_RX_DELAY	0x8
+static int rtl8211f_phy_fix(struct phy_device *phy_dev)
+{
+	u16 reg;
+
+	if (phy_dev->interface == PHY_INTERFACE_MODE_RGMII ||
+		phy_dev->interface == PHY_INTERFACE_MODE_RGMII_ID)
+	{
+		printk("higmac: RTL8211F TXRXDLY fixup\n");
+		/* enable TXDLY */
+		phy_write(phy_dev, RTL8211F_PAGE_SELECT, 0xd08);
+
+		reg = phy_read(phy_dev, 0x11);
+		reg |= RTL8211F_TX_DELAY;
+		phy_write(phy_dev, 0x11, reg);
+
+		reg = phy_read(phy_dev, 0x15);
+		reg |= RTL8211F_RX_DELAY;
+		phy_write(phy_dev, 0x15, reg);
+
+		/* restore to default page 0 */
+		phy_write(phy_dev, RTL8211F_PAGE_SELECT, 0x0);
+	}
+
+	return 0;
+}
+
 void phy_register_fixups(void)
 {
 	phy_register_fixup_for_uid(REALTEK_PHY_ID_8211EG,
@@ -1256,4 +1285,6 @@ void phy_register_fixups(void)
 			DEFAULT_PHY_MASK, KSZ8081RNB_phy_fix);
 	phy_register_fixup_for_uid(PHY_ID_KSZ9031RNX,
 			DEFAULT_PHY_MASK, KSZ9031RNX_phy_fix);
+	phy_register_fixup_for_uid(PHY_ID_RTL8211F,
+			PHY_ID_MASK_RTL8211F, rtl8211f_phy_fix);
 }
