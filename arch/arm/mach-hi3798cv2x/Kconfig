@@ -7,6 +7,7 @@ config MACH_HI3798CV2X
 	select ARM_GIC
 	select ARM_TIMER_SP804
 	select COMMON_CLK
+	select ARCH_REQUIRE_GPIOLIB
 	help
 	  Include support for the hisilion HI3798CV2X platform.
 	  HI3798CV2X support ARM CORTEX-A7 processer,
