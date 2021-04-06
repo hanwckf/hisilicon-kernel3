@@ -26,7 +26,10 @@
 
 #define TAG_EMMC_PARAM 0x48694E7b
 
-extern u32 emmc_tuning_phase;
+u32 emmc_boot_tuning_phase = 3;
+
+#define HS200_MODE  (0x1<<8)
+#define HS400_MODE  (0x2<<8)
 
 static int __init parse_emmc_param(const struct tag *tag, void *fdt)
 {
@@ -38,7 +41,7 @@ static int __init parse_emmc_param(const struct tag *tag, void *fdt)
 	offline = *((u32 *)(&tag->u)); /* disabled okay */
 
 	if (offline) {
-		node = fdt_path_offset(fdt, "himcv200_host0");
+		node = fdt_path_offset(fdt, "emmc");
 		if (node >= 0) {
 			err = fdt_setprop_string(fdt, node, "status", "disabled");
 			if (err)
@@ -47,11 +50,20 @@ static int __init parse_emmc_param(const struct tag *tag, void *fdt)
 		pr_info("emmc is not scaned!\n");
 	}
 
-	emmc_tuning_phase = (*(((u32 *)(&tag->u)) + 1)) & 0xff;
+	emmc_boot_tuning_phase = (*(((u32 *)(&tag->u)) + 1)) & 0xff;
 	cap2 = (*(((u32 *)(&tag->u)) + 1)) & 0xff00;
 
-	if (cap2) {
-		node = fdt_path_offset(fdt, "himcv200_host0");
+	if (cap2 & HS200_MODE) {
+		node = fdt_path_offset(fdt, "emmc");
+		if (node >= 0) {
+			err = fdt_setprop_cell(fdt, node, "caps2", 0x0020);
+			if (err)
+				pr_err("set prop emmc caps2 fail.\n");
+		}
+	}
+
+	if (cap2 & HS400_MODE) {
+		node = fdt_path_offset(fdt, "emmc");
 		if (node >= 0) {
 			err = fdt_setprop_cell(fdt, node, "caps2", 0x8020);
 			if (err)

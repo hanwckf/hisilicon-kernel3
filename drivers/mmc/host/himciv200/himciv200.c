@@ -5,8 +5,6 @@
  * published by the Free Software Foundation.
  */
 
-#define DRVNAME "himciv200"
-#define pr_fmt(fmt) DRVNAME "_%d" ": " fmt
 
 #include <linux/module.h>
 #include <linux/platform_device.h>
@@ -20,7 +18,11 @@
 #include <linux/delay.h>
 #include <linux/hikapi.h>
 #include <linux/clk.h>
-#include <linux/clk-private.h>
+#include "../version.h"
+
+#undef  pr_fmt
+#define DRVNAME "himciv200"
+#define pr_fmt(fmt) DRVNAME "_%d" ": " fmt
 
 #include "himciv200_def.h"
 #include "himciv200.h"
@@ -33,13 +35,21 @@
 
 
 #define himci_pr_dts DBG_OUT
+extern u32 emmc_boot_tuning_phase;
 /*************************************************************************/
+
+#if defined(CONFIG_ARCH_HIFONE) || defined(CONFIG_ARCH_HI3798CV2X)
+#include "himci_hi3798cv2x.c"
+#endif
 
 static u32 detect_time = HI_MCI_DETECT_TIMEOUT;
 static u32 retry_count = MAX_RETRY_COUNT;
 static u32 request_timeout = HI_MCI_REQUEST_TIMEOUT;
 int trace_level = HIMCI_TRACE_LEVEL;
-u32 emmc_tuning_phase = 3;
+int himci_hung = 0;
+
+module_param(himci_hung, uint, 0600);
+MODULE_PARM_DESC(himci_hung, "himci drv hung when error found(default:0))");
 
 module_param(detect_time, uint, 0600);
 MODULE_PARM_DESC(detect_timer, "card detect time (default:500ms))");
@@ -104,18 +114,22 @@ static void himciv200_host_power(struct himciv200_host *host, u32 power_on,
  *0: card remove
  ******************************************************************************/
 
+static int himciv200_get_card_detect_register(struct himciv200_host *host)
+{
+	u32 regval = mci_readl(host, MCI_CDETECT);
+
+	return (regval & HIMCI_CARD0) ? 0 : 1;
+}
+/******************************************************************************/
+
 static int himciv200_card_detect(struct mmc_host *mmc)
 {
 	struct himciv200_host *host = mmc_priv(mmc);
-	u32 regval;
 
-	regval = mci_readl(host, MCI_CDETECT);
+	if (host->force_unpluged)
+		return 0;
 
-	regval &= HIMCI_CARD0;
-
-	regval = !regval;
-
-	return regval;
+	return himciv200_get_card_detect_register(host);
 }
 /******************************************************************************/
 
@@ -124,7 +138,6 @@ static int himciv200_wait_cmd(struct himciv200_host *host)
 	unsigned long timeout = jiffies + msecs_to_jiffies(500);
 	u32 regval = 0;
 	unsigned long flags;
-	struct mmc_command *cmd = host->cmd;
 
 	while (time_before(jiffies, timeout)) {
 		/*
@@ -144,14 +157,14 @@ static int himciv200_wait_cmd(struct himciv200_host *host)
 			mci_writel(host, MCI_RINTSTS, regval);
 			spin_unlock_irqrestore(&host->lock, flags);
 
-			pr_err("hardware locked write error,Other CMD is running, CMD%d(0x%X)\n",
-					host->devid, cmd->opcode, cmd->arg);
+			himci_error("hardware locked write error,Other CMD is running\n",
+					host->devid);
+			himciv200_host_reset(host);
 			return 1;
 		}
 		spin_unlock_irqrestore(&host->lock, flags);
 	}
 
-	pr_err("send cmd to CIU timeout, CMD%d(0x%X)!", host->devid, cmd->opcode, cmd->arg);
 	return -1;
 }
 /******************************************************************************/
@@ -189,7 +202,7 @@ static void himciv200_control_cclk(struct himciv200_host *host, u32 enable)
 	mci_writel(host, MCI_CMD, regval);
 
 	if (himciv200_wait_cmd(host) != 0)
-		pr_err("disable or enable clk is timeout!", host->devid);
+		himci_error("disable or enable clk is timeout!", host->devid);
 }
 /******************************************************************************/
 static void himciv200_set_cclk(struct himciv200_host *host, unsigned int cclk)
@@ -199,7 +212,7 @@ static void himciv200_set_cclk(struct himciv200_host *host, unsigned int cclk)
 
 	himci_trace(2, "begin");
 
-	srcclk = host->clk->ops->recalc_rate(host->clk->hw, 0);
+	srcclk = clk_get_rate(host->clk);
 
 	/*set card clk divider value, clk_divider = Fmmcclk/(Fmmc_cclk * 2) */
 	if (cclk < srcclk) {
@@ -220,7 +233,7 @@ static void himciv200_set_cclk(struct himciv200_host *host, unsigned int cclk)
 	mci_writel(host, MCI_CMD, regval);
 
 	if (himciv200_wait_cmd(host) != 0)
-		pr_err("set card clk divider is failed!", host->devid);
+		himci_error("set card clk divider is failed!", host->devid);
 }
 /******************************************************************************/
 
@@ -248,9 +261,17 @@ static void himciv200_host_init(struct himciv200_host *host)
 	regval = mci_readl(host, MCI_INTMASK);
 	regval &= ~ALL_INT_MASK;
 	regval |= DTO_INT_MASK
-			| CD_INT_MASK
-			| VOLT_SWITCH_INT_MASK;
+		| CARD_DETECT_IRQ_MASK
+		| CD_INT_MASK
+		| VOLT_SWITCH_INT_MASK;
 	mci_writel(host, MCI_INTMASK, regval);
+
+#if defined(CONFIG_ARCH_HI3798MV2X)
+	/* set card read threshold */
+	regval = mci_readl(host, MCI_CARDTHRCTL);
+	regval |= RW_THRESHOLD_SIZE;
+	mci_writel(host, MCI_CARDTHRCTL, regval);
+#endif
 
 	/* enable inner DMA mode and close intr of MMC host controler */
 	regval = mci_readl(host, MCI_CTRL);
@@ -275,10 +296,11 @@ static void himciv200_detect_card(unsigned long arg)
 	unsigned int curr_status;
 	unsigned int status[3];
 	unsigned int detect_retry_count = 0;
+	unsigned long flags;
 
 	while (1) {
 		for (i = 0; i < 3; i++) {
-			status[i] = himciv200_card_detect(host->mmc);
+			status[i] = himciv200_get_card_detect_register(host);
 			udelay(10);
 		}
 		if ((status[0] == status[1]) && (status[0] == status[2]))
@@ -291,14 +313,42 @@ static void himciv200_detect_card(unsigned long arg)
 	}
 
 	curr_status = status[0];
+
+	spin_lock_irqsave(&host->lock, flags);
+	if (!host->card_detect_change) {
+		spin_unlock_irqrestore(&host->lock, flags);
+		goto err ;
+	}
+
+	host->card_detect_change = 0;
+	host->force_unpluged = 1;
+	spin_unlock_irqrestore(&host->lock, flags);
+
+	if (host->force_unpluged) {
+		/*
+		 * previous      current        force_unpluged
+		 * pluged        pluged         1
+		 * pluged        unpluged       0
+		 * unpluged      unpluged       0
+		 * unpluged      pluged         0
+		 */
+		if (host->card_status == CARD_UNPLUGED ||
+		    curr_status == CARD_UNPLUGED)
+			host->force_unpluged = 0;
+		else
+			curr_status = CARD_UNPLUGED;
+	}
+
 	if (curr_status != host->card_status) {
 		himci_trace(2, "begin card_status = %d\n", host->card_status);
 		host->card_status = curr_status;
 		if (curr_status != CARD_UNPLUGED) {
 			himciv200_host_init(host);
 			printk(KERN_INFO "card connected!\n");
-		} else
+		} else {
 			printk(KERN_INFO "card disconnected!\n");
+			himciv200_host_reset(host);
+		}
 
 		mmc_detect_change(host->mmc, 0);
 	}
@@ -359,14 +409,13 @@ static int himciv200_setup_data(struct himciv200_host *host, struct mmc_data *da
 
 	data_size = data->blksz * data->blocks;
 	if (data_size > (DES_BUFFER_SIZE * MAX_DMA_DES)) {
-		pr_err("mci request data_size is too big!\n", host->devid);
+		himci_error("mci request data_size is too big!\n", host->devid);
 		ret = -1;
 		goto out;
 	}
 
-	himci_trace(2, "host->dma_paddr is 0x%08X,host->dma_vaddr is 0x%08X\n",
-		(unsigned int)host->dma_paddr,
-		(unsigned int)host->dma_vaddr);
+	himci_trace(2, "host->dma_paddr is 0x%lX,host->dma_vaddr is 0x%p\n",
+		(unsigned long)host->dma_paddr, host->dma_vaddr);
 
 	des = (struct himci_des *)host->dma_vaddr;
 	des_cnt = 0;
@@ -471,7 +520,7 @@ static int himciv200_exec_cmd(struct himciv200_host *host,
 	mci_writel(host, MCI_CMD, CMD_START | regval);
 
 	if (himciv200_wait_cmd(host) != 0) {
-		pr_err("send card cmd to CIU is failed!, CMD%u(%X)", host->devid, cmd->opcode, cmd->arg);
+		himci_error("send card cmd to CIU is failed!, CMD%u(%X)", host->devid, cmd->opcode, cmd->arg);
 		return -EINVAL;
 	}
 	return 0;
@@ -502,10 +551,12 @@ static void himciv200_cmd_done(struct himciv200_host *host, unsigned int stat)
 	} else if (stat & (RCRC_INT_STATUS | RE_INT_STATUS)) {
 		cmd->error = -EILSEQ;
 		if(!host->tunning) {
-		if (stat & RCRC_INT_STATUS)
-			pr_err(" error: response CRC error (%x), CMD%u(%X)\n", host->devid, stat, cmd->opcode, cmd->arg);
-		if (stat & RE_INT_STATUS)
-			pr_err(" error: response error (%x), CMD%u(%X)\n", host->devid, stat, cmd->opcode, cmd->arg);
+			if (stat & RCRC_INT_STATUS)
+				himci_error(" error: response CRC error (%x), CMD%u(%X)\n", host->devid, stat, cmd->opcode, cmd->arg);
+
+			if (stat & RE_INT_STATUS)
+				himci_error(" error: response error (%x), CMD%u(%X)\n", host->devid, stat, cmd->opcode, cmd->arg);
+
 		}
 	}
 }
@@ -523,10 +574,10 @@ static void himciv200_data_done(struct himciv200_host *host, unsigned int stat)
 	if (stat & (HTO_INT_STATUS | DRTO_INT_STATUS)) {
 		data->error = -ETIMEDOUT;
 		if (stat & HTO_INT_STATUS)
-			pr_err(" error: data starvation-by-host timeout (%x), CMD%u(%X)\n",
+			himci_error(" error: data starvation-by-host timeout (%x), CMD%u(%X)\n",
 					host->devid, stat, cmd->opcode, cmd->arg);
 		if (stat & DRTO_INT_STATUS)
-			pr_err(" error: data read timeout (%x), CMD%u(%X)\n",
+			himci_error(" error: data read timeout (%x), CMD%u(%X)\n",
 					host->devid, stat, cmd->opcode, cmd->arg);
 
 	} else if (stat & (EBE_INT_STATUS | SBE_INT_STATUS |
@@ -534,14 +585,14 @@ static void himciv200_data_done(struct himciv200_host *host, unsigned int stat)
 		data->error = -EILSEQ;
 		if(!host->tunning) {
 		if (stat & EBE_INT_STATUS)
-			pr_err(" error: end-bit error (%x), CMD%u(%X)\n", host->devid, stat, cmd->opcode, cmd->arg);
+			himci_error(" error: end-bit error (%x), CMD%u(%X)\n", host->devid, stat, cmd->opcode, cmd->arg);
 		if (stat & SBE_INT_STATUS)
-			pr_err(" error: start bit error (%x), CMD%u(%X)\n", host->devid, stat, cmd->opcode, cmd->arg);
+			himci_error(" error: start bit error (%x), CMD%u(%X)\n", host->devid, stat, cmd->opcode, cmd->arg);
 		if (stat & FRUN_INT_STATUS)
-			pr_err(" error: FIFO underrun/overrun error (%x), CMD%u(%X)\n",
+			himci_error(" error: FIFO underrun/overrun error (%x), CMD%u(%X)\n",
 					host->devid, stat, cmd->opcode, cmd->arg);
 		if (stat & DCRC_INT_STATUS)
-			pr_err(" error: data CRC error (%x), CMD%u(%X)\n", host->devid, stat, cmd->opcode, cmd->arg);
+			himci_error(" error: data CRC error (%x), CMD%u(%X)\n", host->devid, stat, cmd->opcode, cmd->arg);
 		}
 	}
 
@@ -575,7 +626,7 @@ static int himciv200_wait_cmd_complete(struct himciv200_host *host)
 		spin_lock_irqsave(&host->lock, flags);
 		regval = mci_readl(host, MCI_RINTSTS);
 		spin_unlock_irqrestore(&host->lock, flags);
-		pr_err("wait cmd request complete is timeout!"
+		himci_error("wait cmd request complete is timeout!"
 			"Raw interrupt status 0x%08X, CMD%u(%X)\n", host->devid, regval, cmd->opcode, cmd->arg);
 		return -1;
 	}
@@ -620,8 +671,10 @@ static int himciv200_wait_data_complete(struct himciv200_host *host)
 		spin_lock_irqsave(&host->lock, flags);
 		regval = mci_readl(host, MCI_RINTSTS);
 		spin_unlock_irqrestore(&host->lock, flags);
-		pr_err("wait data request complete is timeout! 0x%08X, CMD%u(%X)\n",
+		himci_error("wait data request complete is timeout! 0x%08X, CMD%u(%X)\n",
 				host->devid, regval, cmd->opcode, cmd->arg);
+		himciv200_idma_stop(host);
+		himciv200_data_done(host, regval);
 		return -1;
 	}
 
@@ -646,14 +699,13 @@ static int himciv200_wait_card_complete(struct himciv200_host *host)
 	u32 count = 0;
 	u32 regval;
 	unsigned long card_jiffies_timeout;
-	struct mmc_command *cmd = host->cmd;
 
 	himci_trace(2, "begin");
 
 	card_jiffies_timeout = jiffies + request_timeout;
 	while (1) {
 		if (!time_before(jiffies, card_jiffies_timeout)) {
-			pr_err("wait card ready complete is timeout!, CMD%u(%X)", host->devid, cmd->opcode, cmd->arg);
+			himci_error("wait card ready complete is timeout!\n", host->devid);
 			return -1;
 		}
 
@@ -696,7 +748,7 @@ static void himciv200_request(struct mmc_host *mmc, struct mmc_request *mrq)
 		ret = himciv200_setup_data(host, mrq->data);
 		if (ret) {
 			mrq->data->error = ret;
-			pr_err("data setup is error!", host->devid);
+			himci_error("data setup is error!", host->devid);
 			goto request_end;
 		}
 
@@ -712,7 +764,7 @@ static void himciv200_request(struct mmc_host *mmc, struct mmc_request *mrq)
 			regval = mci_readl(host, MCI_CTRL);
 			fifo_count++;
 			if (fifo_count >= retry_count) {
-				pr_err("fifo reset is timeout!", host->devid);
+				himci_error("fifo reset is timeout!", host->devid);
 				return;
 			}
 		} while (regval & FIFO_RESET);
@@ -721,6 +773,21 @@ static void himciv200_request(struct mmc_host *mmc, struct mmc_request *mrq)
 	} else {
 		mci_writel(host, MCI_BYTCNT, 0);
 		mci_writel(host, MCI_BLKSIZ, 0);
+	}
+
+	if (mrq->sbc) {
+		ret = himciv200_exec_cmd(host, mrq->sbc, NULL);
+		if (ret) {
+			mrq->sbc->error = ret;
+			goto request_end;
+		}
+
+		/* wait command send complete */
+		ret = himciv200_wait_cmd_complete(host);
+		if (ret) {
+			mrq->sbc->error = ret;
+			goto request_end;
+		}
 	}
 
 	ret = himciv200_exec_cmd(host, mrq->cmd, mrq->data);
@@ -740,11 +807,12 @@ static void himciv200_request(struct mmc_host *mmc, struct mmc_request *mrq)
 			himciv200_idma_stop(host);
 		}
 
-		if (mrq->stop) {
+		if (mrq->stop && (!mrq->sbc
+			|| (mrq->sbc && (mrq->cmd->error || mrq->data->error)))) {
 			ret = himciv200_exec_cmd(host, host->mrq->stop,
 					      NULL);
 			if (ret) {
-				mrq->cmd->error = ret;
+				mrq->stop->error = ret;
 				goto request_end;
 			}
 
@@ -789,333 +857,8 @@ static void himciv200_set_ldo(struct himciv200_host *host, u8 volt)
 		regval |= (SD_LDO_ENABLE | SD_LDO_VOLTAGE)<<host->ldo_shift;
 		writel(regval, host->ldoaddr);
 	} else {
-		pr_err("NO Support this voltage\n", host->devid);
+		himci_error("NO Support this voltage\n", host->devid);
 	}
-}
-/******************************************************************************/
-u32 iohs[] = {
-	0, DRV_STENGTH_18V_3MA,
-	1, DRV_STENGTH_18V_3MA,
-	2, DRV_STENGTH_18V_3MA,
-	3, DRV_STENGTH_18V_3MA,
-	4, DRV_STENGTH_18V_3MA,
-	5, DRV_STENGTH_18V_3MA,
-	6, DRV_STENGTH_18V_3MA,
-	7, DRV_STENGTH_18V_3MA,
-	9, DRV_STENGTH_18V_3MA,
-	10, DRV_STENGTH_18V_3MA,
-	0xff, 0xff,
-};
-
-u32 iohs200[] = {
-	0, DRV_STENGTH_18V_6MA,
-	1, DRV_STENGTH_18V_6MA,
-	2, DRV_STENGTH_18V_6MA,
-	3, DRV_STENGTH_18V_6MA,
-	4, DRV_STENGTH_18V_6MA,
-	5, DRV_STENGTH_18V_6MA,
-	6, DRV_STENGTH_18V_6MA,
-	7, DRV_STENGTH_18V_6MA,
-	9, DRV_STENGTH_18V_6MA,
-	10, DRV_STENGTH_18V_8MA,
-	0xff, 0xff,
-};
-u32 iohs400[] = {
-	0, DRV_STENGTH_18V_8MA,
-	1, DRV_STENGTH_18V_8MA,
-	2, DRV_STENGTH_18V_8MA,
-	3, DRV_STENGTH_18V_8MA,
-	4, DRV_STENGTH_18V_8MA,
-	5, DRV_STENGTH_18V_8MA,
-	6, DRV_STENGTH_18V_8MA,
-	7, DRV_STENGTH_18V_8MA,
-	9, DRV_STENGTH_18V_8MA,
-	10, DRV_STENGTH_18V_8MA,
-	0xff, 0xff,
-};
-
-/******************************************************************************/
-#if defined(CONFIG_ARCH_HI3798CV2X)
-
-#ifndef REG_BASE_SCTL
-#define REG_BASE_SCTL                      (0xF8000000)
-#endif
-
-#ifndef REG_SC_GEN29
-#define REG_SC_GEN29                        0x00F4
-#endif
-unsigned int get_mmc_io_voltage(void)
-{
-	unsigned int voltage = 0;
-	void __iomem *virtaddr;
-
-	virtaddr = ioremap_nocache(REG_BASE_SCTL + REG_SC_GEN29, PAGE_SIZE);
-	if (!virtaddr) {
-		printk("ioremap emmc error.\n");
-		return 1;
-	}
-
-	voltage = readl(virtaddr);
-	voltage &= EMMC_IO_VOLTAGE_MASK;
-
-	iounmap(virtaddr);
-
-	return voltage;
-}
-#endif
-#define HS400_MAX_CLK  150000000;
-/******************************************************************************/
-
-static void himciv200_set_timing(struct himciv200_host * host, u8 timing)
-{
-	u32 ix, regval;
-
-	/* config io driver strength */
-	if (timing == MMC_TIMING_UHS_DDR50) {
-		//TODO: XXX
-	} else if (timing == MMC_TIMING_MMC_DDR52) {
-		//TODO: XXX
-	} else if (timing == MMC_TIMING_MMC_HS200) {
-		if (host->devid == 0)  {
-			for (ix = 0; iohs200[ix] != 0xff; ix += 2) {
-				regval = readl( host->ioshare_addr +iohs200[ix]*4);
-				regval &= ~(DRV_STENGTH_MASK);
-				regval |= (DRV_SLEV_RATE | iohs200[ix+1]);
-				writel(regval, host->ioshare_addr +iohs200[ix]*4);
-			}
-
-			/* hs200 clk slew rate config 0 */
-			regval = readl( host->ioshare_addr +0x028);
-			regval &= ~DRV_SLEV_RATE;
-			writel(regval, host->ioshare_addr +0x028);
-
-			/* config clk phase */
-			regval = (u32)host->clk->ops->get_phase(host->clk->hw);
-			regval &= ~(SDIO_DRV_PS_MASK);
-			regval |=  SDIO_DRV_PS_135_67DOT5;
-			host->clk->ops->set_phase(host->clk->hw, (int)regval);
-		}
-	} else if (timing == MMC_TIMING_MMC_HS400) {
-		if (host->devid == 0)  {
-			/* config driver strength */
-			for (ix = 0; iohs400[ix] != 0xff; ix += 2) {
-				regval = readl( host->ioshare_addr +iohs400[ix]*4);
-				regval &= ~(DRV_STENGTH_MASK);
-				regval &= ~DRV_SLEV_RATE;
-				regval |=  iohs400[ix+1];
-				writel(regval, host->ioshare_addr +iohs400[ix]*4);
-			}
-		}
-	}
-	/* config source clock */
-	if(timing == MMC_TIMING_MMC_HS) {
-		host->mmc->f_max = 50000000;
-	} else if (timing == MMC_TIMING_UHS_DDR50) {
-		host->mmc->f_max = 50000000;
-	} else if (timing == MMC_TIMING_MMC_DDR52) {
-		host->mmc->f_max = 100000000;
-	} else if (timing == MMC_TIMING_MMC_HS200) {
-		host->mmc->f_max = 200000000;
-	} else if (timing == MMC_TIMING_MMC_HS400) {
-		host->mmc->f_max = 150000000;
-	}
-
-	if (host->clk->ops->set_rate) {
-		host->clk->ops->set_rate(host->clk->hw,
-				(unsigned long)host->mmc->f_max, 0);
-	}
-
-	/* ddr uhs reg */
-	regval = mci_readl(host, MCI_UHS_REG);
-	if (timing == MMC_TIMING_UHS_DDR50 ||
-			timing == MMC_TIMING_MMC_DDR52) {
-		regval |= ENABLE_UHS_DDR_MODE;
-	} else {
-		regval &= ~ENABLE_UHS_DDR_MODE;
-	}
-	mci_writel(host, MCI_UHS_REG, regval);
-
-#if defined(CONFIG_ARCH_HI3798CV2X)
-	/* enable shift */
-	if (timing == MMC_TIMING_MMC_DDR52) {
-		if (host->devid == 0)  {
-			/* config clk phase */
-			regval = (u32)host->clk->ops->get_phase(host->clk->hw);
-			regval &= ~(SDIO_SAP_PS_MASK);
-			if (host->iovoltage == EMMC_IO_VOL_1_8V)
-				regval |= SDIO_SAP_PS_225_112DOT5;
-			else
-				regval |= SDIO_SAP_PS_135_67DOT5;
-			host->clk->ops->set_phase(host->clk->hw, (int)regval);
-
-			regval = mci_readl(host, MCI_ENABLE_SHIFT);
-			regval |= ENABLE_SHIFT_01;
-			mci_writel(host, MCI_ENABLE_SHIFT, regval);
-		}
-	}else if ((timing == MMC_TIMING_MMC_HS) ||(timing == MMC_TIMING_LEGACY)){
-
-		if (host->devid == 0)  {
-			for (ix = 0; iohs[ix] != 0xff; ix += 2) {
-				regval = readl( host->ioshare_addr +iohs[ix]*4);
-				regval &= ~(DRV_STENGTH_MASK);
-				regval |= (DRV_SLEV_RATE | iohs[ix+1]);
-				writel(regval, host->ioshare_addr +iohs[ix]*4);
-			}
-
-			/* config clk phase */
-			regval = (u32)host->clk->ops->get_phase(host->clk->hw);
-			regval &= ~(SDIO_SAP_PS_MASK | SDIO_DRV_PS_MASK);
-			regval |=  SDIO_SAP_PS_45_22DOT5 | SDIO_DRV_PS_180_90;
-			host->clk->ops->set_phase(host->clk->hw, (int)regval);
-			regval = mci_readl(host, MCI_ENABLE_SHIFT);
-			regval &= ~ENABLE_SHIFT_01;
-			mci_writel(host, MCI_ENABLE_SHIFT, regval);
-		}
-	} else if(timing == MMC_TIMING_MMC_HS400) {
-		if (host->devid == 0)  {
-			regval = (u32)host->clk->ops->get_phase(host->clk->hw);
-			regval &= ~(SDIO_SAP_PS_MASK | SDIO_DRV_PS_MASK);
-			regval |=  (emmc_tuning_phase << SDIO_SAP_PS_OFFSET) | SDIO_DRV_PS_90_45;
-			host->clk->ops->set_phase(host->clk->hw, (int)regval);
-
-			regval = mci_readl(host, MCI_ENABLE_SHIFT);
-			regval &= ~ENABLE_SHIFT_01;
-			mci_writel(host, MCI_ENABLE_SHIFT, regval);
-		}
-	}
-#endif
-	/* hs200/hs400 cardthrctl reg */
-	regval = mci_readl(host, MCI_CARDTHRCTL);
-	if (timing == MMC_TIMING_MMC_HS200)
-		regval = READ_THRESHOLD_SIZE;
-	if (timing  ==  MMC_TIMING_MMC_HS400)
-		regval = RW_THRESHOLD_SIZE;
-	mci_writel(host, MCI_CARDTHRCTL, regval);
-
-	/* hs400 ddr reg */
-	regval = mci_readl(host, MCI_DDR_REG);
-	if (timing == MMC_TIMING_MMC_HS400)
-		regval |= ENABLE_HS400_MODE;
-	else
-		regval &= ~ENABLE_HS400_MODE;
-	mci_writel(host, MCI_DDR_REG, regval);
-}
-/******************************************************************************/
-
-static int himciv200_prepare_hs400(struct mmc_host * mmc, struct mmc_ios * ios)
-{
-	u32 ix, regval;
-	struct himciv200_host *host = mmc_priv(mmc);
-
-	if (host->devid == 0)  {
-		/* config driver strength */
-		for (ix = 0; iohs400[ix] != 0xff; ix += 2) {
-			regval = readl( host->ioshare_addr +iohs400[ix]*4);
-			regval &= ~(DRV_STENGTH_MASK);
-			regval &= ~DRV_SLEV_RATE;
-			regval |=  iohs400[ix+1];
-			writel(regval, host->ioshare_addr +iohs400[ix]*4);
-		}
-
-		/* config source clock */
-		host->mmc->f_max = HS400_MAX_CLK;
-		host->clk->ops->set_rate(host->clk->hw,
-				(unsigned long)host->mmc->f_max, 0);
-
-		/* config clk phase */
-		regval = (u32)host->clk->ops->get_phase(host->clk->hw);
-		regval &= ~(SDIO_DRV_PS_MASK);
-		regval |=  SDIO_DRV_PS_90_45;
-		host->clk->ops->set_phase(host->clk->hw, (int)regval);
-	}
-
-	return 0;
-}
-/******************************************************************************/
-
-int himciv200_execute_tuning(struct mmc_host * mmc, u32 opcode)
-{
-	u32 index, regval;
-	struct himciv200_host *host = mmc_priv(mmc);
-#if 1
-	if (host->devid == 0)  {
-		index = emmc_tuning_phase;
-		regval = (u32)host->clk->ops->get_phase(host->clk->hw);
-		regval &= ~SDIO_SAP_PS_MASK;
-		regval |= (index << SDIO_SAP_PS_OFFSET);
-		host->clk->ops->set_phase(host->clk->hw, (int)regval);
-	}
-#else
-
-	u32 found = 0, startp =-1, endp = -1;
-	int prev_err, err = 0;
-
-
-	host->tunning = 1;
-
-	for (index = 0; index < SDIO_SAP_PS_NUM; index++) {
-
-		/* set phase shift */
-		regval = (u32)host->clk->ops->get_phase(host->clk->hw);
-		regval &= ~SDIO_SAP_PS_MASK;
-		regval |= (index << SDIO_SAP_PS_OFFSET);
-		host->clk->ops->set_phase(host->clk->hw, (int)regval);
-
-		mci_writel(host,  MCI_RINTSTS, ALL_INT_CLR);
-
-		err = mmc_send_tuning(mmc);
-
-		if (!err) {
-			/* found first valid phase */
-			found = 1;
-		}
-		if (index > 0) {
-			if (err && !prev_err)
-				endp = index - 1;
-
-			if (!err && prev_err)
-				startp = index;
-		}
-
-		if ((startp != -1) && (endp != -1))
-			goto tuning_out;
-
-		prev_err = err;
-		err = 0;
-	}
-
-tuning_out:
-
-	if (found) {
-
-		if (-1 == startp)
-			startp = 0;
-		if (-1 == endp)
-			endp = SDIO_SAP_PS_NUM -1;
-
-		if (endp < startp) {
-			if (endp - 0 > SDIO_SAP_PS_NUM -1 - startp)
-				index = (endp + 0) / 2;
-			else
-				index = (SDIO_SAP_PS_NUM -1 + startp) / 2;
-		} else
-			index = (startp + endp) / 2;
-
-		regval = (u32)host->clk->ops->get_phase(host->clk->hw);
-		regval &= ~SDIO_SAP_PS_MASK;
-		regval |= (index << SDIO_SAP_PS_OFFSET);
-		host->clk->ops->set_phase(host->clk->hw, (int)regval);
-
-		printk(KERN_NOTICE "Tuning clk_sample[%d,%d],set[%d]\n", startp, endp, index);
-	} else {
-		printk(KERN_NOTICE "No valid phase shift! use default\n");
-		return -1;
-	}
-
-	host->tunning = 0;
-	mci_writel(host,  MCI_RINTSTS, ALL_INT_CLR);
-#endif
-	return 0;
 }
 /******************************************************************************/
 
@@ -1154,7 +897,7 @@ static int himciv200_switch_voltage(struct mmc_host *mmc,
 		if (!(regval & ENABLE_UHS_VDD_180))
 			return 0;
 
-		pr_err("Switching to 3.3V signalling voltage failed\n", host->devid);
+		himci_error("Switching to 3.3V signalling voltage failed\n", host->devid);
 		return -EAGAIN;
 
 	case MMC_SIGNAL_VOLTAGE_180:
@@ -1189,7 +932,7 @@ static int himciv200_switch_voltage(struct mmc_host *mmc,
 			}
 		}
 
-		pr_err("Switching to 1.8V signalling voltage failed\n", host->devid);
+		himci_error("Switching to 1.8V signalling voltage failed\n", host->devid);
 		return -EAGAIN;
 	case MMC_SIGNAL_VOLTAGE_120:
 		himciv200_set_ldo(host, ios->signal_voltage);
@@ -1210,6 +953,7 @@ static void himciv200_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 	himci_trace(3, "ios->power_mode = %d ", ios->power_mode);
 	himci_trace(3, "ios->clock = %d ", ios->clock);
 	himci_trace(3, "ios->bus_width = %d ", ios->bus_width);
+	himci_trace(3, "ios->timing = %d ", ios->timing);
 
 	if (!ios->clock) {
 		himciv200_control_cclk(host, false);
@@ -1227,7 +971,9 @@ static void himciv200_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 
 	if (ios->clock) {
 		himciv200_control_cclk(host, false);
+#if defined(CONFIG_ARCH_HI3798CV2X) || defined (CONFIG_ARCH_HI3798MV2X)
 		himciv200_set_timing(host, ios->timing);
+#endif
 		himciv200_set_cclk(host, ios->clock);
 		himciv200_control_cclk(host, true);
 	}
@@ -1242,6 +988,36 @@ static void himciv200_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 		regval |= CARD_WIDTH_1;
 	}
 	mci_writel(host, MCI_CTYPE, regval);
+
+	/* ddr uhs reg */
+	regval = mci_readl(host, MCI_UHS_REG);
+	if (ios->timing == MMC_TIMING_UHS_DDR50 ||
+			ios->timing == MMC_TIMING_MMC_DDR52) {
+		regval |= ENABLE_UHS_DDR_MODE;
+	} else {
+		regval &= ~ENABLE_UHS_DDR_MODE;
+	}
+	mci_writel(host, MCI_UHS_REG, regval);
+
+	/* hs200/hs400 cardthrctl reg */
+	regval = mci_readl(host, MCI_CARDTHRCTL);
+#if defined(CONFIG_ARCH_HI3798MV2X)
+	regval = RW_THRESHOLD_SIZE;
+#else
+	if (ios->timing == MMC_TIMING_MMC_HS200)
+		regval = READ_THRESHOLD_SIZE;
+	if (ios->timing  ==  MMC_TIMING_MMC_HS400)
+		regval = RW_THRESHOLD_SIZE;
+#endif
+	mci_writel(host, MCI_CARDTHRCTL, regval);
+
+	/* hs400 ddr reg */
+	regval = mci_readl(host, MCI_DDR_REG);
+	if (ios->timing == MMC_TIMING_MMC_HS400)
+		regval |= ENABLE_HS400_MODE;
+	else
+		regval &= ~ENABLE_HS400_MODE;
+	mci_writel(host, MCI_DDR_REG, regval);
 
 }
 /******************************************************************************
@@ -1282,16 +1058,23 @@ static void himciv200_enable_sdio_irq(struct mmc_host *mmc, int enable)
 {
 	struct himciv200_host *host = mmc_priv(mmc);
 	u32 regval;
+	unsigned long flags;
 
 	himci_trace(2, "begin");
+
+	if (!in_interrupt())
+		spin_lock_irqsave(&host->lock, flags);
 
 	regval = mci_readl(host, MCI_INTMASK);
 	if (enable) {
 		regval |= SDIO_INT_MASK;
 	} else {
-		regval &= ~SDIO_INT_MASK;
+		regval &= (~SDIO_INT_MASK);
 	}
 	mci_writel(host, MCI_INTMASK, regval);
+
+	if (!in_interrupt())
+		spin_unlock_irqrestore(&host->lock, flags);
 }
 /******************************************************************************/
 
@@ -1319,6 +1102,12 @@ static irqreturn_t himciv200_irq(int irq, void *dev_id)
 	spin_lock_irqsave(&host->lock, flags);
 	state = mci_readl(host, MCI_MINTSTS);
 	himci_trace(2, "irq state 0x%08X\n", state);
+
+	if (state & CARD_DETECT_IRQ_STATUS) {
+		mci_writel(host, MCI_RINTSTS, CARD_DETECT_IRQ_STATUS);
+
+		host->card_detect_change = 1;
+	}
 
 	if (state & DTO_INT_STATUS) {
 		regval = mci_readl(host, MCI_INTMASK);
@@ -1363,6 +1152,10 @@ static irqreturn_t himciv200_irq(int irq, void *dev_id)
 	}
 
 	if (state & SDIO_INT_STATUS) {
+		regval = mci_readl(host, MCI_INTMASK);
+		regval &= ~SDIO_INT_MASK;
+		mci_writel(host, MCI_INTMASK, regval);
+
 		mci_writel(host, MCI_RINTSTS, SDIO_INT_STATUS);
 		mmc_signal_sdio_irq(host->mmc);
 	}
@@ -1384,8 +1177,10 @@ static const struct mmc_host_ops himci_ops = {
 	.enable_sdio_irq = himciv200_enable_sdio_irq,
 	.start_signal_voltage_switch = himciv200_switch_voltage,
 	.card_busy = himciv200_card_busy,
+#if defined(CONFIG_ARCH_HI3798CV2X) || defined (CONFIG_ARCH_HI3798MV2X)
 	.execute_tuning = himciv200_execute_tuning,
 	.prepare_hs400_tuning = himciv200_prepare_hs400,
+#endif
 	.select_drive_strength = NULL,
 	.hw_reset = himciv200_hw_reset,
 };
@@ -1457,6 +1252,7 @@ static int __init himciv200_pltm_probe(struct platform_device *pdev)
 		goto out;
 	}
 
+#if defined(CONFIG_ARCH_HI3798CV2X) || defined (CONFIG_ARCH_HI3798MV2X)
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
 	host->ioshare_addr = devm_ioremap_resource(&pdev->dev, res);
 	if (IS_ERR_OR_NULL(host->ioshare_addr)) {
@@ -1465,6 +1261,8 @@ static int __init himciv200_pltm_probe(struct platform_device *pdev)
 		goto out;
 	}
 
+	host->iovoltage = get_mmc_io_voltage();
+#endif
 
 	host->irq = platform_get_irq(pdev, 0);
 	if (host->irq < 0) {
@@ -1488,15 +1286,14 @@ static int __init himciv200_pltm_probe(struct platform_device *pdev)
 		goto out;
 	}
 
-#if defined(CONFIG_ARCH_HI3798CV2X)
-	host->iovoltage = get_mmc_io_voltage();
-#endif
 	clk_prepare_enable(host->clk);
 
 	spin_lock_init(&host->lock);
 
 	himciv200_host_init(host);
 
+	host->card_detect_change = 0;
+	host->force_unpluged = 0;
 	host->card_status = himciv200_card_detect(host->mmc);
 	if (!host->card_status) {
 		printk(KERN_NOTICE "%s: eMMC/MMC/SD Device NOT detected!\n",
@@ -1563,10 +1360,14 @@ static int himciv200_pltm_remove(struct platform_device *pdev)
 		mmc_remove_host(mmc);
 		himciv200_host_power(host, false, false);
 		himciv200_control_cclk(host, false);
-		iounmap(host->ioaddr);
-		iounmap(host->ioshare_addr);
-		iounmap(host->ldoaddr);
-		dma_free_coherent(&pdev->dev, PAGE_SIZE, host->dma_vaddr,
+		if (host->ioaddr)
+			iounmap(host->ioaddr);
+		if (host->ioshare_addr)
+			iounmap(host->ioshare_addr);
+		if (host->ldoaddr)
+			iounmap(host->ldoaddr);
+		if (host->dma_vaddr)
+			dma_free_coherent(&pdev->dev, PAGE_SIZE, host->dma_vaddr,
 				  host->dma_paddr);
 		mmc_free_host(mmc);
 	}
@@ -1653,6 +1454,8 @@ himciv200_match[] __maybe_unused = {
 	{ .compatible = "Hi3716Cv200,himciv200", },
 	{ .compatible = "hi3798mv100,himciv200", },
 	{ .compatible = "hi3798cv200,himciv200", },
+	{ .compatible = "hi3798mv200,himciv200", },
+	{ .compatible = "hi3796mv200,himciv200", },
 	{},
 };
 MODULE_DEVICE_TABLE(of, hi3716cv200_himciv200_match);
@@ -1684,7 +1487,7 @@ EXPORT_SYMBOL(himciv200_get_driver);
 
 static int __init himciv200_module_init(void)
 {
-	printk("registered new interface driver himciv200\n");
+	printk("registered new interface driver himci%s\n", HIMCI_VERSION_STRING);
 
 	return platform_driver_register(&himciv200_pltfm_driver);
 }

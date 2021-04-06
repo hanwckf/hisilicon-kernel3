@@ -47,6 +47,9 @@
 	.rate = _rate,     \
 	.ops = _ops,}
 
+#define SDIO_SAP_PS_SHIFT_BIT              (12)
+#define SDIO_SAP_PS_MASK                   (0x7 << 12)
+#define SDIO_DRV_PS_MASK                   (0x7 << 16)
 /******************************************************************************/
 
 extern struct clk_ops clk_ops_hiusb2;
@@ -73,6 +76,12 @@ static struct hiclk_hw hiclks_hw[] = {
 	CLK_SHARED(HIGMAC_MAC_IF1_CLK, PERI_CRG51_GSF, 0x2000000, 0x2000000, 0, 0, NULL),
 	CLK(PERI_CRG99_PCIECTRL, 0x0, 0x0, 0x0, 0, &clk_ops_hipcie),
 	CLK(PERI_CRG42_SATA3CTRL, 0x0, 0x0, 0x0, 0, &clk_ops_hiahci),
+	CLK_SHARED(HII2C_I2C0_CLK, PERI_CRG27_I2C, 0x10, 0x10, BIT(5), _100MHz, NULL),
+	CLK_SHARED(HII2C_I2C1_CLK, PERI_CRG27_I2C, 0x100, 0x100, BIT(9), _100MHz, NULL),
+	CLK_SHARED(HII2C_I2C2_CLK, PERI_CRG27_I2C, 0x1000, 0x1000, BIT(13), _100MHz, NULL),
+	CLK_SHARED(HII2C_I2C3_CLK, PERI_CRG27_I2C, 0x10000, 0x10000, BIT(17), _100MHz, NULL),
+	CLK_SHARED(HII2C_I2C4_CLK, PERI_CRG27_I2C, 0x100000, 0x100000, BIT(21), _100MHz, NULL),
+	CLK(PERI_CRG28_SSP, 0x1, 0x1, BIT(1), _100MHz, NULL),
 	CLK(HIIR_CLK, 0x0, 0x0, 0, _24MHz, &clk_ops_hiir),
 };
 /******************************************************************************/
@@ -88,26 +97,41 @@ static unsigned long hiclk_recalc_rate_hi3798cv200(struct clk_hw *hw,
 	switch (clk->id) {
 	case PERI_CRG39_SDIO0:{
 		unsigned long rate[] = {
-		_100MHz, _50MHz, _150MHz, _166dot5MHz};
-		clk->rate = rate[(val >> 8) & 0x7];
+			_100MHz, _50MHz, _150MHz, _166dot5MHz};
+
+		val = (val >> 8) & 0x7;
+		if (val >= ARRAY_SIZE(rate))
+			panic("register value out of range.\n");
+
+		clk->rate = rate[val];
 		break;
 	}
 	case PERI_CRG40_SDIO1:{
 		unsigned long rate[] = {
-		_100MHz, _50MHz, _25MHz, _200MHz, _300MHz, _337dot5MHz,_150MHz};
-		clk->rate = rate[(val >> 8) & 0x7];
+			_100MHz, _50MHz, _25MHz, _200MHz, _300MHz, _337dot5MHz, _150MHz};
+
+		val = (val >> 8) & 0x7;
+		if (val >= ARRAY_SIZE(rate))
+			panic("register value out of range.\n");
+
+		clk->rate = rate[val];
 		break;
 	}
 	case PERI_CRG163_SDIO2:{
 		unsigned long rate[] = {
-		_100MHz, _50MHz, _150MHz, _166dot5MHz};
-		clk->rate = rate[(val >> 8) & 0x7];
+			_100MHz, _50MHz, _150MHz, _166dot5MHz};
+
+		val = (val >> 8) & 0x7;
+		if (val >= ARRAY_SIZE(rate))
+			panic("register value out of range.\n");
+
+		clk->rate = rate[val];
 		break;
 	}
 	case PERI_CRG224_FMC: {
 		unsigned long rate[] = {
-		_200MHz, _100MHz, _125MHz,_12MHz,
-		_12MHz, _62dot5MHz, _75MHz, _37dot5MHz};
+			_200MHz, _100MHz, _125MHz,_12MHz,
+			_12MHz, _62dot5MHz, _75MHz, _37dot5MHz};
 		val = (val >> 5) & 0x7;
 		clk->rate = rate[val];
 		break;
@@ -123,7 +147,7 @@ static unsigned long hiclk_recalc_rate_hi3798cv200(struct clk_hw *hw,
 static int hiclk_set_rate_hi3798cv200(struct clk_hw *hw, unsigned long drate,
 				unsigned long parent_rate)
 {
-	u32 val,	ix;
+	u32 val, ix;
 	struct hiclk_hw *clk = to_hiclk_hw(hw);
 
 	val = readl(clk->peri_crgx);
@@ -131,38 +155,44 @@ static int hiclk_set_rate_hi3798cv200(struct clk_hw *hw, unsigned long drate,
 	switch (clk->id) {
 	case PERI_CRG39_SDIO0:{
 		unsigned long rate[] = {
-		_100MHz, _50MHz, _150MHz, _166dot5MHz};
-		for (ix = 0; ix < 4; ix++) {
+			_100MHz, _50MHz, _150MHz, _166dot5MHz};
+
+		for (ix = 0; ix < ARRAY_SIZE(rate); ix++) {
 			if (drate == rate[ix]) {
 				val &= ~(0x7 << 8);
 				val |= (ix << 8);
 				writel(val, clk->peri_crgx);
 			}
 		}
+
 		break;
 	}
 	case PERI_CRG40_SDIO1:{
 		unsigned long rate[] = {
-		_100MHz, _50MHz, _25MHz, _200MHz, _300MHz, _337dot5MHz, _150MHz};
-		for (ix = 0; ix < 7; ix++) {
+			_100MHz, _50MHz, _25MHz, _200MHz, _300MHz, _337dot5MHz, _150MHz};
+
+		for (ix = 0; ix < ARRAY_SIZE(rate); ix++) {
 			if (drate == rate[ix]) {
 				val &= ~(0x7 << 8);
 				val |= (ix << 8);
 				writel(val, clk->peri_crgx);
 			}
 		}
+
 		break;
 	}
 	case PERI_CRG163_SDIO2:{
 		unsigned long rate[] = {
-		_100MHz, _50MHz, _150MHz, _166dot5MHz};
-		for (ix = 0; ix < 4; ix++) {
+			_100MHz, _50MHz, _150MHz, _166dot5MHz};
+
+		for (ix = 0; ix < ARRAY_SIZE(rate); ix++) {
 			if (drate == rate[ix]) {
 				val &= ~(0x7 << 8);
 				val |= (ix << 8);
 				writel(val, clk->peri_crgx);
 			}
 		}
+
 		break;
 	}
 	default:
@@ -184,12 +214,15 @@ static int hiclk_get_phase_hi3798cv200(struct clk_hw *hw)
 	case PERI_CRG40_SDIO1:
 	case PERI_CRG163_SDIO2:{
 		val = readl(clk->peri_crgx);
+		/* send drive and sample phase together, so shift 12bit for sum < 360 */
+		val &= (SDIO_SAP_PS_MASK | SDIO_DRV_PS_MASK);
+		val = val >> SDIO_SAP_PS_SHIFT_BIT;
 		break;
 	}
 	default:
 		break;
 	}
-	
+
 	return (int)val;
 }
 /******************************************************************************/
@@ -199,12 +232,13 @@ static int hiclk_set_phase_hi3798cv200(struct clk_hw *hw, int degrees)
 	u32 val;
 	struct hiclk_hw *clk = to_hiclk_hw(hw);
 
-	val = (u32)degrees;
-	
 	switch (clk->id) {
 	case PERI_CRG39_SDIO0:
 	case PERI_CRG40_SDIO1:
 	case PERI_CRG163_SDIO2:{
+		val = readl(clk->peri_crgx);
+		val &= ~(SDIO_SAP_PS_MASK | SDIO_DRV_PS_MASK);
+		val |= (((u32)degrees) << SDIO_SAP_PS_SHIFT_BIT);
 		writel(val, clk->peri_crgx);
 		break;
 	}
@@ -214,7 +248,7 @@ static int hiclk_set_phase_hi3798cv200(struct clk_hw *hw, int degrees)
 
 	return 0;
 }
-	
+
 /******************************************************************************/
 
 static int hiclk_enable_hi3798cv200(struct clk_hw *hw)
@@ -229,7 +263,7 @@ static struct clk_ops clk_ops_hi3798cv200 = {
 	.enable = hiclk_enable_hi3798cv200,
 	.recalc_rate = hiclk_recalc_rate_hi3798cv200,
 	.set_rate = hiclk_set_rate_hi3798cv200,
-	.get_phase =hiclk_get_phase_hi3798cv200,
+	.get_phase = hiclk_get_phase_hi3798cv200,
 	.set_phase = hiclk_set_phase_hi3798cv200,
 };
 /******************************************************************************/

@@ -67,6 +67,7 @@
 #define DTO_INT_MASK                      BIT(3)
 #define VOLT_SWITCH_INT_MASK              BIT(10)
 #define SDIO_INT_MASK                     BIT(16)
+#define CARD_DETECT_IRQ_MASK              BIT(0)
 
 /* MCI_CMD REG(0X2C) */
 #define CMD_START                         BIT(31)
@@ -105,6 +106,7 @@
 #define DTO_INT_STATUS                    BIT(3)
 #define CD_INT_STATUS                     BIT(2)
 #define RE_INT_STATUS                     BIT(1)
+#define CARD_DETECT_IRQ_STATUS            BIT(0)
 #define ALL_INT_CLR                       (0x1efff)
 
 /* MCI_STATUS(0x48) details */
@@ -114,16 +116,26 @@
 #if defined(CONFIG_ARCH_HIFONE) || defined(CONFIG_ARCH_HI3798CV2X)
 #define BURST_SIZE                        (0x4<<28)
 #else
+#if defined(CONFIG_ARCH_HI3798MV2X)
+#define BURST_SIZE                        (0x3<<28)
+#else
 #define BURST_SIZE                        (0x2<<28)
+#endif
 #endif
 
 #ifdef CONFIG_ARCH_GODBOX
 #define FIFO_DEPTH                         16
-#elif defined(CONFIG_ARCH_S40) || defined(CONFIG_ARCH_HI3798MX) || defined(CONFIG_ARCH_HIFONE) || defined(CONFIG_ARCH_HI3798CV2X)
+#else
 #define FIFO_DEPTH                         256
 #endif
+
+#if defined(CONFIG_ARCH_HI3798MV2X)
+#define RX_WMARK                           (0xF << 16)
+#define TX_WMARK                           0x10
+#else
 #define RX_WMARK                           ((FIFO_DEPTH/2 - 1) << 16)
 #define TX_WMARK                           ((FIFO_DEPTH/2) << 0)
+#endif
 
 /* MCI_CDETECT(0x50) */
 #define HIMCI_CARD0                        BIT(0)
@@ -165,43 +177,4 @@
 #define SD_LDO_BYPASS                      BIT(6)
 #define SD_LDO_ENABLE                      BIT(5)
 #define SD_LDO_VOLTAGE                     BIT(4)
-
-/* Phase details */
-#define SDIO_DRV_PS_MASK                   (0x7 << 16)
-#define SDIO_DRV_PS_0_0                    (0b000 << 16)
-#define SDIO_DRV_PS_45_22DOT5              (0b001 << 16)
-#define SDIO_DRV_PS_90_45                  (0b010 << 16)
-#define SDIO_DRV_PS_135_67DOT5             (0b011 << 16)
-#define SDIO_DRV_PS_180_90                 (0b100 << 16)
-#define SDIO_DRV_PS_225_112DOT5            (0b101 << 16)
-#define SDIO_DRV_PS_270_145                (0b110 << 16)
-#define SDIO_DRV_PS_315_167DOT5            (0b111 << 16)
-
-#define SDIO_SAP_PS_NUM                    (8)
-#define SDIO_SAP_PS_MASK                   (0x7 << 12)
-#define SDIO_SAP_PS_OFFSET                 (12)
-#define SDIO_SAP_PS_0_0                    (0b000 << 12)
-#define SDIO_SAP_PS_45_22DOT5              (0b001 << 12)
-#define SDIO_SAP_PS_90_45                  (0b010 << 12)
-#define SDIO_SAP_PS_135_67DOT5             (0b011 << 12)
-#define SDIO_SAP_PS_180_90                 (0b100 << 12)
-#define SDIO_SAP_PS_225_112DOT5            (0b101 << 12)
-#define SDIO_SAP_PS_270_145                (0b110 << 12)
-#define SDIO_SAP_PS_315_167DOT5            (0b111 << 12)
-
-/* Driver strength details */
-#define DRV_STENGTH_MASK                   (0xf << 4)
-#define DRV_STENGTH_18V_3MA                (0b1101 << 4)
-#define DRV_STENGTH_18V_4MA                (0b1100 << 4)
-#define DRV_STENGTH_18V_6MA                (0b1011 << 4)
-#define DRV_STENGTH_18V_8MA                (0b1001 << 4)
-#define DRV_STENGTH_18V_9MA                (0b1000 << 4)
-#define DRV_STENGTH_18V_13MA               (0b0100 << 4)
-#define DRV_STENGTH_18V_18MA               (0b0000 << 4)
-#define DRV_SLEV_RATE                      BIT(8)
-
-#define EMMC_IO_VOLTAGE_MASK               (0x01)
-#define EMMC_IO_VOL_1_8V                   (0x01)
-#define EMMC_IO_VOL_3_3V                   (0x00)
-
 #endif
