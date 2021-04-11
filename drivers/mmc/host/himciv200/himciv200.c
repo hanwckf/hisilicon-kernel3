@@ -1058,7 +1058,7 @@ static void himciv200_enable_sdio_irq(struct mmc_host *mmc, int enable)
 {
 	struct himciv200_host *host = mmc_priv(mmc);
 	u32 regval;
-	unsigned long flags;
+	unsigned long flags = 0;
 
 	himci_trace(2, "begin");
 
